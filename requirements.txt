@@ -1,0 +1,11 @@
+faster-whisper
+sounddevice
+numpy
+pyttsx3
+groq
+python-dotenv
+pypdf
+python-docx
+pydantic
+httpx
+beautifulsoup4
