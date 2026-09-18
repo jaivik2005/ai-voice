@@ -12,4 +12,6 @@ class WebSearchAgent:
         plan = plan_query(query, mode=mode)
         all_results = []
         for planned_query in plan.queries: all_results.extend(self.engine.search(planned_query, plan.options).results)
-        return summarize(query, rank_and_deduplicate(all_results)[:plan.options.max_results])
+        prefer_official = mode in {"docs", "website"} or "official" in query.lower()
+        ranked = rank_and_deduplicate(all_results, prefer_official=prefer_official)
+        return summarize(query, ranked[:plan.options.max_results])

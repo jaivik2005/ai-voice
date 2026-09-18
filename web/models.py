@@ -13,9 +13,9 @@ class SearchOptions(BaseModel):
 
 class SearchResult(BaseModel):
     title: str
-    url: str
+    url: str = ""
     snippet: str = ""
-    source: str
+    source: str = ""
     published_date: str | None = None
     relevance_score: float = 0.0
 

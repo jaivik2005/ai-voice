@@ -1,6 +1,7 @@
 """The safe coordinator joining NLU, validation, context, and filesystem tools."""
 from __future__ import annotations
 import re
+import logging
 from pathlib import Path
 from core.context import ConversationContext
 from core.intent import Action, Operation
@@ -9,8 +10,9 @@ from database.history import record
 from documents.extractor import extract_text
 from documents.search import search_documents
 from filesystem.manager import FileManager
-from filesystem.path_resolver import PathResolver
-from filesystem.search import search_files
+from filesystem.path_resolver import PathResolver, _display_path
+from filesystem.search import search_files_in_roots
+from config import search_roots
 from security.confirmation import PendingConfirmation
 
 class FileAssistant:
@@ -26,7 +28,17 @@ class FileAssistant:
         if normalized in {"no", "cancel", "never mind"}: self.context.pending = None; return "Cancelled."
         operations = self.planner.plan(command)
         if not operations: return "I couldn't map that to a safe operation. Try ‘create a folder called Project in Documents’ or ‘search Python documentation’."
-        return "\n".join(self._execute(operation, command=command) for operation in operations)
+        responses = []
+        for operation in operations:
+            result = self._execute(operation, command=command)
+            if operation.action is Action.SEARCH_FILES and result == "No matching files found.":
+                from core.nlu import has_web_intent
+                if has_web_intent(command):
+                    web_operations = [candidate for candidate in self.planner.plan(command) if candidate.action is not Action.SEARCH_FILES]
+                    if web_operations:
+                        result = self._execute(web_operations[0], command=command)
+            responses.append(result)
+        return "\n".join(responses)
     def _path(self, value: str, *, base: Path | None = None) -> Path: return self.resolver.resolve(value, self.context, base=base)
     def _existing(self, value: str) -> Path:
         candidate = self._path(value)
@@ -63,7 +75,7 @@ class FileAssistant:
                 except PageFetchError:
                     result = "I couldn't access that page, but the search result is still available: " + selected["title"]
             elif op.action in {Action.WEB_SEARCH, Action.NEWS_SEARCH, Action.DOCUMENTATION_SEARCH, Action.GITHUB_SEARCH, Action.WEBSITE_SEARCH, Action.RESEARCH}:
-                mode = {Action.NEWS_SEARCH: "news", Action.DOCUMENTATION_SEARCH: "docs", Action.GITHUB_SEARCH: "github", Action.RESEARCH: "research"}.get(op.action, "web")
+                mode = {Action.NEWS_SEARCH: "news", Action.DOCUMENTATION_SEARCH: "docs", Action.GITHUB_SEARCH: "github", Action.WEBSITE_SEARCH: "website", Action.RESEARCH: "research"}.get(op.action, "web")
                 query = p["query"]
                 if self.web is None:
                     from web.search_agent import WebSearchAgent
@@ -76,9 +88,28 @@ class FileAssistant:
             elif op.action is Action.CREATE_FILE:
                 target = self._path(p["location"]) / p["name"]; result = self.files.create_file(target); self.context.remember(target)
             elif op.action is Action.LIST_DIRECTORY:
-                target = self._known_or_resolved(p["path"]); entries = self.files.list_directory(target); self.context.remember(target); result = f"{target} is empty." if not entries else "\n".join(str(x) for x in entries[:50])
+                target = self.resolver.resolve_directory(p["path"], self.context)
+                entries = self.files.list_directory(target)
+                self.context.remember(target)
+                if not entries:
+                    result = f"{_display_path(target)} is empty."
+                else:
+                    lines = [f"Contents of {_display_path(target)}:"]
+                    for entry in entries[:50]:
+                        marker = "[DIR]" if entry.is_dir() else "[FILE]"
+                        lines.append(f"{marker} {entry.name}")
+                    result = "\n".join(lines)
             elif op.action is Action.SEARCH_FILES:
-                root = self._path(p["path"]); matches = search_files(root, p["query"], p["extension"], p["min_size"], p["modified_today"]); self.context.recent_paths = matches[:10]; result = "No matching files found." if not matches else "Found:\n" + "\n".join(str(x) for x in matches[:20])
+                root = self._path(p["path"])
+                roots = search_roots() if p["path"] == "." else (root,)
+                logging.getLogger(__name__).debug("Resolved intent=%s path=%s roots=%s", op.action.value, root, roots)
+                matches = search_files_in_roots(roots, p["query"], p["extension"], p["min_size"], p["modified_today"])
+                self.context.recent_paths = matches[:10]
+                if not matches:
+                    result = "No matching files found."
+                else:
+                    result = f"Found {len(matches)} matching file" + ("s" if len(matches) != 1 else "") + ":\n"
+                    result += "\n".join(f"[{index}] {path.name}\nPath: {path}" for index, path in enumerate(matches[:20], 1))
             elif op.action is Action.DELETE:
                 target = self._existing(p["path"]); result = self.files.delete(target); self.context.remember(target.parent)
             elif op.action is Action.RENAME:
@@ -86,7 +117,9 @@ class FileAssistant:
             elif op.action in {Action.MOVE, Action.COPY}:
                 source, destination = self._existing(p["source"]), self._path(p["destination"]); result = self.files.move(source, destination) if op.action is Action.MOVE else self.files.copy(source, destination); self.context.remember(destination / source.name if destination.is_dir() else destination)
             elif op.action is Action.OPEN:
-                target = self._path(p["path"]); result = self.files.open_path(target); self.context.remember(target)
+                target = self.resolver.resolve_directory(p["path"], self.context) if self._looks_like_directory_request(p["path"]) else self._path(p["path"])
+                logging.getLogger(__name__).debug("Resolved intent=%s path=%s exists=%s directory=%s", op.action.value, target, target.exists(), target.is_dir())
+                result = self.files.open_path(target); self.context.remember(target)
             elif op.action is Action.READ_DOCUMENT:
                 target = self._existing(p["path"]); result = extract_text(target)[:4000] or "The document contains no extractable text."; self.context.remember(target)
             elif op.action is Action.SEARCH_DOCUMENTS:
@@ -97,3 +130,10 @@ class FileAssistant:
             record(command, op.action.value, result); return result
         except (OSError, ValueError, RuntimeError) as exc:
             result = str(exc); record(command, op.action.value, "ERROR: " + result); return result
+
+    @staticmethod
+    def _looks_like_directory_request(value: str) -> bool:
+        lowered = value.lower().strip()
+        return (lowered.endswith((" folder", " directory")) or
+                lowered in {"project", "this project", "my project", "home", "home directory", "my files", "documents", "downloads", "pictures", "videos", "music", "desktop"} or
+                lowered.startswith(("my ", "the ")))

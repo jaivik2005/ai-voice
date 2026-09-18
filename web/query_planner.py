@@ -7,7 +7,9 @@ def plan_query(question: str, *, mode: str = "web") -> QueryPlan:
     query = question.strip()
     options = SearchOptions()
     if mode == "news": options.recency = "pw"
-    if mode == "docs": options.domain = None
+    if mode == "docs":
+        options.domain = None
+        query = f"{query} official documentation"
     if mode == "github": options.domain = "github.com"
     research = mode == "research"
     queries = [query]

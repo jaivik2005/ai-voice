@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from core.assistant import FileAssistant
 from core.context import ConversationContext
 from documents.search import search_documents
@@ -63,5 +64,128 @@ class AssistantTests(unittest.TestCase):
         a = self.assistant
         a.files.open_path = lambda path: f"Opened safely: {path}"
         self.assertIn("Opened safely", a.handle("open ."))
+
+    def test_home_aliases_use_existing_directories(self):
+        with tempfile.TemporaryDirectory() as temporary_home:
+            home = Path(temporary_home)
+            (home / "Document").mkdir()
+            (home / "Download").mkdir()
+            with patch("pathlib.Path.home", return_value=home), patch.dict("os.environ", {"HOME": str(home)}), patch("filesystem.path_resolver.subprocess.run", side_effect=OSError):
+                resolver = PathResolver()
+                context = ConversationContext()
+                self.assertEqual(home / "Document", resolver.resolve("my Documents", context))
+                self.assertEqual(home / "Document", resolver.resolve("my Documents folder", context))
+                self.assertEqual(home / "Document", resolver.resolve("Documents", context))
+                self.assertEqual(home / "Download", resolver.resolve("my Downloads", context))
+                self.assertEqual(home, resolver.resolve("home directory", context))
+                self.assertEqual(home, resolver.resolve("~", context))
+
+    def test_home_search_finds_semantic_resume_and_pdfs(self):
+        with tempfile.TemporaryDirectory() as temporary_home:
+            home = Path(temporary_home)
+            documents = home / "Documents"
+            downloads = home / "Downloads"
+            documents.mkdir()
+            downloads.mkdir()
+            (documents / "Resume_2026.pdf").write_text("resume", encoding="utf-8")
+            (documents / "AI Project Report.pdf").write_text("report", encoding="utf-8")
+            (downloads / "notes.txt").write_text("notes", encoding="utf-8")
+            environment = {"ASSISTANT_ALLOWED_ROOTS": f"{documents},{downloads}"}
+            with patch("pathlib.Path.home", return_value=home), patch.dict("os.environ", environment, clear=False):
+                assistant = FileAssistant()
+                resume = assistant.handle("find my resume")
+                pdfs = assistant.handle("where is my PDF")
+                self.assertIn("Resume_2026.pdf", resume)
+                self.assertIn(str(documents / "Resume_2026.pdf"), resume)
+                self.assertIn("AI Project Report.pdf", pdfs)
+                self.assertNotIn("notes.txt", pdfs)
+
+    def test_open_home_folder_and_invalid_folder_are_safe(self):
+        with tempfile.TemporaryDirectory() as temporary_home:
+            home = Path(temporary_home)
+            documents = home / "Documents"
+            documents.mkdir()
+            environment = {"ASSISTANT_ALLOWED_ROOTS": str(documents)}
+            with patch("pathlib.Path.home", return_value=home), patch.dict("os.environ", {**environment, "HOME": str(home)}, clear=False), patch("filesystem.path_resolver.subprocess.run", side_effect=OSError):
+                assistant = FileAssistant()
+                open_path = assistant.files.open_path
+                assistant.files.open_path = lambda path: f"Opening {path}"
+                self.assertIn(str(documents), assistant.handle("open my Documents folder"))
+                assistant.files.open_path = open_path
+                documents.rmdir()
+                self.assertIn("I couldn't find", assistant.handle("open my Documents folder"))
+
+    def test_relative_and_absolute_paths_keep_their_meaning(self):
+        absolute = self.root / "absolute.txt"
+        absolute.touch()
+        context = ConversationContext()
+        resolver = PathResolver()
+        self.assertEqual(absolute, resolver.resolve(str(absolute), context))
+        self.assertEqual(Path("~").expanduser(), resolver.resolve("~", context))
+        self.assertEqual(WORKING_DIRECTORY / "relative.txt", resolver.resolve("relative.txt", context))
+
+    def test_file_directory_detection_and_allowed_root(self):
+        file_path = self.root / "file.txt"
+        file_path.touch()
+        with self.assertRaises(NotADirectoryError): self.assistant.files.list_directory(file_path)
+        with self.assertRaises(SecurityError): validate_path(Path("/tmp"))
+
+    def test_destructive_actions_still_require_confirmation(self):
+        target = self.root / "remove.txt"
+        target.touch()
+        response = self.assistant.handle(f"delete {target}")
+        self.assertIn("Do you want", response)
+        self.assertTrue(target.exists())
+        self.assertEqual("Cancelled.", self.assistant.handle("no"))
+        self.assertTrue(target.exists())
+
+    def test_show_home_directory_lists_only_that_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_home:
+            home = Path(temporary_home)
+            pictures = home / "Pictures"
+            pictures.mkdir()
+            (pictures / "photo.jpg").touch()
+            (home / "project-secret.txt").touch()
+            with patch("pathlib.Path.home", return_value=home), patch.dict("os.environ", {"HOME": str(home)}), patch("filesystem.path_resolver.subprocess.run", side_effect=OSError):
+                assistant = FileAssistant()
+                result = assistant.handle("show my Pictures")
+                self.assertIn("Contents of ~/Pictures", result)
+                self.assertIn("photo.jpg", result)
+                self.assertNotIn("project-secret.txt", result)
+
+    def test_open_project_folder_uses_project_root(self):
+        project = self.root / "assistant-project"
+        project.mkdir()
+        with patch("filesystem.path_resolver.PROJECT_ROOT", project):
+            assistant = FileAssistant()
+            assistant.files.open_path = lambda path: f"Opening {path}"
+            self.assertEqual(f"Opening {project}", assistant.handle("open my project folder"))
+
+    def test_unknown_folder_search_opens_unique_allowed_match(self):
+        with tempfile.TemporaryDirectory() as temporary_home:
+            home = Path(temporary_home)
+            python_folder = home / "Documents" / "python-project"
+            python_folder.mkdir(parents=True)
+            with patch("pathlib.Path.home", return_value=home), patch.dict("os.environ", {"HOME": str(home)}), patch("filesystem.path_resolver.subprocess.run", side_effect=OSError), patch("filesystem.path_resolver.search_roots", return_value=(home,)):
+                assistant = FileAssistant()
+                assistant.files.open_path = lambda path: f"Opening {path}"
+                self.assertEqual(f"Opening {python_folder}", assistant.handle("open my python folder"))
+
+    def test_unknown_folder_search_reports_ambiguity(self):
+        with tempfile.TemporaryDirectory() as temporary_home:
+            home = Path(temporary_home)
+            first = home / "Documents" / "Python"
+            second = home / "Downloads" / "python_project"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            with patch("pathlib.Path.home", return_value=home), patch.dict("os.environ", {"HOME": str(home)}), patch("filesystem.path_resolver.subprocess.run", side_effect=OSError), patch("filesystem.path_resolver.search_roots", return_value=(home,)):
+                result = FileAssistant().handle("open my python folder")
+                self.assertIn("multiple folders", result)
+                self.assertIn("Python", result)
+                self.assertIn("python_project", result)
+
+    def test_directory_traversal_is_rejected(self):
+        with self.assertRaises(SecurityError):
+            validate_path(Path.home() / "Documents" / ".." / ".." / "tmp")
 
 if __name__ == "__main__": unittest.main()

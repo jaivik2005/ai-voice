@@ -3,42 +3,74 @@ from __future__ import annotations
 import re
 from core.intent import Action, Operation
 
+COMMON_TYPOS = {
+    "webste": "website",
+    "doucmentation": "documentation",
+    "serach": "search",
+    "offical": "official",
+    "latestt": "latest",
+}
+
 def _quoted_or_tail(text: str, pattern: str) -> str | None:
     m = re.search(pattern, text, re.I)
     return m.group(1).strip(" '\".") if m else None
 
+def _normalize_common_typos(text: str) -> str:
+    return re.sub(r"\b[\w]+\b", lambda match: COMMON_TYPOS.get(match.group(0).lower(), match.group(0)), text)
+
+def _has_local_intent(text: str) -> bool:
+    return bool(re.search(r"\b(?:my\s+(?:file|files|document|documents|resume|project\s+report)|where\s+is|open\s+my|folder|pdf)\b", text, re.I))
+
+def _has_web_intent(text: str) -> bool:
+    return bool(re.search(r"\b(?:search|look\s+up|website|official|documentation|docs|latest|news|headlines|online|google|github|url|web)\b", text, re.I))
+
+def has_web_intent(text: str) -> bool:
+    """Return whether a command has strong web intent after typo normalization."""
+    normalized = _normalize_common_typos(text.strip())
+    return _has_web_intent(normalized) and not _has_local_intent(normalized)
+
 class RuleBasedNLU:
     def parse(self, text: str) -> list[Operation]:
-        t = text.strip(); low = t.lower()
+        t = _normalize_common_typos(text.strip()); low = t.lower()
         if re.fullmatch(r"(?:yes|confirm|do it|proceed)", low): return []
         if re.fullmatch(r"(?:no|cancel|never mind)", low): return []
         result_ref = re.fullmatch(r"(?:open|read)\s+(?:the\s+)?(first|second|third|\d+)(?:\s+(?:search\s+)?result)?", low)
         if result_ref:
             raw = result_ref.group(1); index = {"first": 1, "second": 2, "third": 3}.get(raw, int(raw) if raw.isdigit() else 1)
             return [Operation(Action.WEB_OPEN_RESULT, {"index": index})]
+        local_intent = _has_local_intent(t)
+        web_intent = _has_web_intent(t) and not local_intent
         # Web patterns come before file "find/search" patterns. A domain or
         # web-specific qualifier makes the intended agent unambiguous.
-        if re.match(r"(?:find|search)\s+(?:the\s+)?official\s+(?:website|site)\s+(?:of|for)\s+", low):
+        if web_intent and re.match(r"(?:find|search)\s+(?:the\s+)?official\s+(?:website|site)\s+(?:of|for)\s+", low):
             query = re.sub(r"^(?:find|search)\s+(?:the\s+)?official\s+(?:website|site)\s+(?:of|for)\s+", "", t, flags=re.I).strip(" .")
             return [Operation(Action.WEBSITE_SEARCH, {"query": query})]
-        if "github" in low and re.search(r"\b(?:find|search|look up|show)\b", low):
+        if web_intent and "github" in low and re.search(r"\b(?:find|search|look up|show)\b", low):
             query = re.sub(r"\b(?:on\s+)?github\b", "", t, flags=re.I)
             query = re.sub(r"^(?:find|search|look up|show)\s+", "", query, flags=re.I).strip(" .")
             return [Operation(Action.GITHUB_SEARCH, {"query": query})]
-        if re.search(r"\b(?:news|headlines|latest|today|current|recently|this week|this month|newest|updated|now)\b", low) and re.search(r"\b(?:find|search|what|who|when|where|news|latest|current|recent|updated)\b", low):
+        if web_intent and re.search(r"\b(?:news|headlines|latest|today|current|recently|this week|this month|newest|updated|now)\b", low) and re.search(r"\b(?:find|search|what|who|when|where|news|latest|current|recent|updated)\b", low):
             query = re.sub(r"^(?:find|search|what(?:'s| is)?|show me|tell me)\s+", "", t, flags=re.I).strip(" .")
             return [Operation(Action.NEWS_SEARCH, {"query": query, "fresh": True})]
-        if re.search(r"\b(?:documentation|docs|api reference)\b", low):
+        if web_intent and re.search(r"\b(?:documentation|docs|api reference)\b", low):
             query = re.sub(r"\b(?:documentation|docs|api reference)\b", "", t, flags=re.I)
             query = re.sub(r"^(?:find|search|look up)\s+", "", query, flags=re.I).strip(" .")
             return [Operation(Action.DOCUMENTATION_SEARCH, {"query": query})]
-        if re.match(r"(?:research|compare|investigate)\b", low):
+        if web_intent and re.match(r"(?:research|compare|investigate)\b", low):
             return [Operation(Action.RESEARCH, {"query": re.sub(r"^(?:research|compare|investigate)\s+", "", t, flags=re.I).strip(" .")})]
-        if re.match(r"(?:web\s+)?(?:search|look up)\s+", low):
-            return [Operation(Action.WEB_SEARCH, {"query": re.sub(r"^(?:web\s+)?(?:search|look up)\s+", "", t, flags=re.I).strip(" .")})]
+        if web_intent and re.match(r"(?:web\s+)?(?:search|look up)\s+", low):
+            query = re.sub(r"^(?:web\s+)?(?:search|look up)\s+", "", t, flags=re.I)
+            query = re.sub(r"^(?:the\s+)?web\s+(?:for\s+)?", "", query, flags=re.I)
+            return [Operation(Action.WEB_SEARCH, {"query": query.strip(" .")})]
         if low.startswith(("show", "list", "what is inside")):
-            location = _quoted_or_tail(t, r"(?:inside|in)\s+(.+)$") or "."
+            location = _quoted_or_tail(t, r"(?:inside|in)\s+(.+)$")
+            if not location:
+                location = re.sub(r"^(?:show|list)(?:\s+me)?\s+", "", t, flags=re.I).strip(" .") or "."
             return [Operation(Action.LIST_DIRECTORY, {"path": location})]
+        if low.startswith(("where is", "where are")):
+            location = re.sub(r"^(?:where is|where are)\s+(?:my\s+)?", "", t, flags=re.I).strip(" .")
+            ext = ".pdf" if re.search(r"\bpdfs?\b", low) else None
+            return [Operation(Action.SEARCH_FILES, {"path": ".", "query": "" if ext else location, "extension": ext, "min_size": None, "modified_today": False})]
         if low.startswith(("find", "search")):
             if "document where" in low or "document containing" in low:
                 query = re.split(r"(?:where|containing)", t, flags=re.I, maxsplit=1)[-1].strip(" .")

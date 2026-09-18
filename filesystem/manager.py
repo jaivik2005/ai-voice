@@ -47,4 +47,4 @@ class FileManager:
     def open_path(self, path: Path) -> str:
         path = validate_path(path, must_exist=True)
         subprocess.Popen(["xdg-open", str(path)], start_new_session=True)
-        return f"Opened: {path}"
+        return f"Opening {path}"
